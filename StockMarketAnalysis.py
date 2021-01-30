@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat May 30 12:27:14 2020
+
+@author: gregmullen
+"""
+
+'''
+This module contains functions used to aggregate stock price data from Yahoo Finance, process the data into an analysis-friendly
+form, perform SVD of the data, and analyze/visualize the results of SVD. The module is used in the two Jupyter Notebooks contained
+in this project 'stock_price_svd_clustering.ipynb' and 'update_price_database.ipynb'
+'''
+
+class CollectData(object):
+    
+    def update_database(
+        self,
+        symbols,
+        path='data/individual',
+        period='max',
+        limit=2000, 
+        overwrite=True
+        ):
+
+        '''
+        Parameters
+        symbols: list of str
+            stock ticker symbols to collect data for
+        path: str
+            path to folder containing individual stock price charts
+        period: str
+            time period over which price chart should be collected - valid periods: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+        limit: int
+            max number of symbols to iterate over for a given loop of the update process Yahoo Finance API may limit pulls
+        overwrite: bool
+            if true, existing database will be overwritten with data collected while running functions
+        '''
+    
+        import os, contextlib
+        import yfinance as yf
+        import time
+        
+        # remove symbols with existing price data from list for update if not overwriting
+        if not overwrite:
+            symbols_to_ignore = list(map(lambda x: x[:x.find('.csv')], os.listdir(path)))
+            symbols = [x for x in symbols if x not in symbols_to_ignore]
+        
+        # preprocessing to ensure symbols are compatible with entries in Yahoo Finance
+        symbols = [x for x in symbols if '$' not in x]
+        symbols = [x.replace('.','-') for x in symbols]
+        
+        print('Number of symbols remaining = {}'.format(len(symbols)))
+        print('')
+        
+        loop = 1
+        symbols_start = []
+
+        # loop over list of symbols searching price data for each until looping does not result in any new updates
+        while symbols != symbols_start:
+    
+            symbols_start = symbols.copy()
+            
+            limit = limit if limit else len(symbols)
+            end = min(limit, len(symbols))
+            is_valid = [False] * len(symbols) # list for keeping track of valid updates
+
+            # force silencing of verbose API
+            with open(os.devnull, 'w') as devnull:
+                with contextlib.redirect_stdout(devnull):
+                    for i in range(0, end):
+                        time.sleep(0.1) # so we don't overload yahoo finance api
+                        s = symbols[i]
+                        data = yf.download(s, period=period) # pull price chart for given symbol from yahoo finance
+                        if len(data.index) == 0:
+                            continue
+        
+                        is_valid[i] = True
+                        data.to_csv(path + '/' +'{}.csv'.format(s))
+        
+            print('Loop '+str(loop)+' complete.')
+            print('Total number of valid symbols downloaded = {}'.format(sum(is_valid)))
+            
+            # update list of symbols for next loop, removing those for which valid pulls occured
+            if len(symbols) > 0:
+                symbols = symbols[symbols.index([x for x in symbols if is_valid[symbols.index(x)]][-1])+1:]
+            
+            print('Number of symbols remaining = {}'.format(len(symbols)))
+            print('')
+            
+            loop += 1
+                
+    def read_database(
+        self,
+        path='data/individual'
+        ):
+
+        '''
+        Parameters
+        path: str
+            path to folder containing individual stock price charts
+        '''
+
+        import os
+        import pandas as pd
+        
+        # make list of names for individual stock price charts
+        file_list = os.listdir(path)
+
+        # read individual files into a list of dataframes
+        df_list = []
+        for name in file_list:
+            try:
+                symbol = name[:name.find('.csv')]
+                df = pd.read_csv(path+'/'+name)
+                df[symbol] = df['Adj Close']
+                df = df.set_index('Date')
+                df_list += [df[symbol]]
+                if (file_list.index(name)+1)%500 == 0:
+                    print('Stocks processed: '+str(file_list.index(name)+1))
+            except:
+                pass
+
+        # concatenate into a single dataframe
+        self.prices = pd.concat(df_list,axis=1)
+
+        return self
+
+class ProcessData(object):
+    
+    def __init__(
+        self,
+        prices
+        ):
+
+        self.prices = prices
+
+        '''
+        Parameters
+        prices: DataFrame
+            DataFrame of daily stock prices generated by the CollectData section
+        '''
+    
+    # this function adapts the prices DataFrame for the given time period to be analyzed
+    # as of now, the program is only written to look backward a specified number of years from the present day
+    # in the future I may add functionality to specify a specific date range 
+    def restrict_timeline(
+        self,
+        years
+        ):
+
+        '''
+        Parameters
+        years: int
+            number of years to count backward from present day for analysis
+        '''
+
+        import pandas as pd
+        
+        # filter prices DataFrame using specified timeframe
+        self.prices['Date'] = pd.to_datetime(self.prices['Date'])
+        start_date = self.prices['Date'].max() - pd.Timedelta(365*years, unit='D')
+        self.prices = self.prices[self.prices.Date >= start_date]
+        
+        # deal with missing values
+        self.prices = self.prices.dropna(axis=1, how='all')
+        self.prices = self.prices.interpolate()
+        self.prices = self.prices.dropna(axis=1)
+        
+        self.prices = self.prices.set_index('Date')
+            
+    def normalize_prices(
+        self
+        ):
+
+        self.prices = self.prices/self.prices.iloc[0]
+        
+    # this function removes outliers by maximum price reached in price chart
+    # the z-score threshold method of outlier idenitification is used 
+    def remove_outliers_max(
+        self,
+        z_threshold=6,
+        show_plot=True
+        ):
+
+        '''
+        Parameters
+        z_threshold: float
+            threshold z-score for outlier removal
+        show_plot: bool
+            if true, a plot of the z-scores for all retained symbols is generated
+        '''
+
+        import numpy as np
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        
+        # DataFrame of max stock prices in prices DataFrame
+        df_outlier = self.prices.max().sort_values().to_frame().rename(columns={0:'max'})
+        df_outlier = df_outlier[~df_outlier.isin([np.nan, np.inf, -np.inf]).any(1)]
+        
+        # these lists are used to determine when the loop below has converged
+        retained_symbols = df_outlier.index.values.tolist()
+        retained_symbols_last = []
+        
+        # z-score for each symbol in df_outlier is calculated and used to filter out symbols outside the threshold
+        # if any outliers were removed, the program loops again - this repeats until convergence
+        i = 0
+        while (retained_symbols_last != retained_symbols):
+            retained_symbols_last = df_outlier.index.values.tolist()
+            df_outlier['Z_SCORE'] = (df_outlier - df_outlier.mean())/df_outlier.std().sort_values()
+            df_outlier = df_outlier[df_outlier.Z_SCORE.apply(np.abs) < z_threshold]
+            retained_symbols = df_outlier.index.values.tolist()
+            i += 1
+    
+        print('Iterations to convergence: '+str(i))
+        
+        if show_plot:
+            df_outlier['index'] = [x for x in range(df_outlier['max'].size)]
+            sns.set(font_scale=2, context='paper')
+            sns.lmplot('index', 'max', df_outlier, aspect=1.5, fit_reg=False)
+            plt.show()
+            
+        # update prices DataFrame
+        self.prices = self.prices[df_outlier.index.values]
+            
+    # this function removes outliers by maximum daily change in price chart
+    # the z-score threshold method of outlier idenitification is used  
+    def remove_outliers_jump(
+        self,
+        z_threshold=6,
+        show_plot=True
+        ):
+
+        '''
+        Parameters
+        z_threshold: float
+            threshold z-score for outlier removal
+        show_plot: bool
+            if true, a plot of the z-scores for all retained symbols is generated
+        '''
+
+        import numpy as np
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        
+        # DataFrame of max daily changes in prices DataFrame
+        df_outlier = self.prices.diff().dropna().apply(np.abs).max().sort_values().to_frame().rename(columns={0:'max_jump'})
+        df_outlier = df_outlier[~df_outlier.isin([np.nan, np.inf, -np.inf]).any(1)]
+        
+        # these lists are used to determine when the loop below has converged
+        retained_symbols = df_outlier.index.values.tolist()
+        retained_symbols_last = []
+        
+        # z-score for each symbol in df_outlier is calculated and used to filter out symbols outside the threshold
+        # if any outliers were removed, the program loops again - this repeats until convergence
+        i = 0
+        while (retained_symbols_last != retained_symbols):
+            retained_symbols_last = df_outlier.index.values.tolist()
+            df_outlier['Z_SCORE'] = (df_outlier - df_outlier.mean())/df_outlier.std().sort_values()
+            df_outlier = df_outlier[df_outlier.Z_SCORE.apply(np.abs) < z_threshold]
+            retained_symbols = df_outlier.index.values.tolist()
+            i += 1
+            
+        print('Iterations to convergence: '+str(i))
+        
+        if show_plot:
+            df_outlier['index'] = [x for x in range(df_outlier['max_jump'].size)]
+            sns.set(font_scale=2, context='paper')
+            sns.lmplot('index', 'max_jump', df_outlier, aspect=1.5, fit_reg=False)
+            plt.show()
+        
+        # update prices DataFrame
+        self.prices = self.prices[df_outlier.index.values]
+        
+class SVD(object):
+    
+    def __init__(
+        self,
+        prices
+        ):
+        self.prices = prices
+    
+        '''
+        Parameters
+        prices: DataFrame
+            DataFrame of daily stock prices generated by the CollectData and processed by ProcessData section
+        '''
+
+    def get_svd(
+        self,
+        plot_singular_values=True
+        ):
+
+        '''
+        Parameters
+        plot_singular_values: bool
+            if true, a plot of the magnitudes of the singular values is generated
+        '''
+
+        import numpy as np
+        import seaborn as sns
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        
+        # compute the singular value decomposition
+        self.U, self.S, self.VT = np.linalg.svd(self.prices)
+
+        data_plot_svd = pd.DataFrame(data=self.S, columns=['SINGULAR_VALUE']).reset_index()
+        data_plot_svd['index'] = pd.to_numeric(data_plot_svd.index) + 1
+
+        # calculation of Gavish-Donoho noise floor
+        beta = self.prices.shape[0]/self.prices.shape[1]
+        omega = 0.56*beta**3 - 0.95*beta**2 + 1.82*beta + 1.43
+        self.hard_threshold = omega*data_plot_svd.SINGULAR_VALUE.median()
+        self.noise_floor = data_plot_svd[data_plot_svd.SINGULAR_VALUE > self.hard_threshold].size
+        
+        if plot_singular_values:
+            
+            print('Singular values above noise floor: '+str(self.noise_floor))
+            
+            f, ax = plt.subplots(figsize=(7, 7))
+            ax.set(yscale='log')
+            sns.set(font_scale=2, context='paper')
+            sns.regplot(
+                'index', 
+                'SINGULAR_VALUE', 
+                data_plot_svd, 
+                ax=ax, 
+                fit_reg=False, 
+                scatter_kws={"s": 5}
+                )
+            plt.axhline(y=self.hard_threshold, linewidth=2, linestyle='dashed', color='grey')
+            plt.show()
+        
+        return self
+    
+    def plot_eigenprices(
+        self,
+        num_comp
+        ):
+
+        '''
+        Parameters
+        num_comp: int
+            number of eigenprice plots to show
+        '''
+
+        import matplotlib.pyplot as plt
+        from pandas.plotting import register_matplotlib_converters
+        register_matplotlib_converters()
+        import pandas as pd
+        import seaborn as sns
+
+        i = 0
+        while i <= num_comp-1:
+            f, ax = plt.subplots(figsize=(14, 7))
+            data_svd_scaled = pd.DataFrame(data=self.VT[i], columns=['SVD_'+str(i+1)], index=self.prices.columns.values)
+            data_svd_scaled = data_svd_scaled/(data_svd_scaled.iloc[0])
+            data_svd_scaled = data_svd_scaled.reset_index().rename(columns={'index':'Date'})
+            sns.lineplot(data=data_svd_scaled, x='Date', y='SVD_'+str(i+1))
+            plt.show()
+            i+=1
+
+    def plot_similar_interactive(
+        self,
+        symbol,
+        n_comp=None,
+        n_similar=20,
+        save_fig=False,
+        save_path=None
+        ):
+
+        '''
+        Parameters
+        symbol: str
+            number of eigenprice plots to show
+        n_comp: None or int
+            number of singular values to use for analysis - best option is to leave as None and determine using noise floor
+        n_similar: int
+            number of similar symbols to show in plot
+        save_fig: bool
+            if true, the figure is saved to the path specified by save_path
+        save_path: str
+            see save_fig
+        '''
+
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import pandas as pd
+        from sklearn.preprocessing import StandardScaler
+
+        if n_comp == None:
+            n_val = self.noise_floor
+        else:
+            n_val = n_comp
+
+        # similarity between symbols is deterimined using the values in the U matrix
+        df = pd.DataFrame(data=self.U.T, columns=self.prices.index.values).loc[[x for x in range(n_val)]]
+
+        scaler = StandardScaler()
+        df = pd.DataFrame(data=scaler.fit_transform(df), columns=df.columns, index=df.index)
+
+        # values in the U matrix are scaled by the corresponding singular value magnitudes
+        for x in range(n_val):
+            df.iloc[x] = df.iloc[x]*self.S[x]
+
+        # Euclidean distance calculated between target symbol and all other symbols
+        distances = df.drop([symbol], axis=1)
+        distances = distances.apply(lambda x: (x - df[symbol].values)**2).sum().sort_values()
+
+        # dataframe containing n_similar closest matches specified
+        data_plot = self.prices.T[distances.index.values[:n_similar]]
+        print(data_plot.columns.values)
+
+        data_plot['Date'] = pd.to_datetime(data_plot.index.values)
+        data_plot = data_plot.rename(columns={'value':'Price'})
+        data_plot = data_plot.rename(columns={'variable':'Symbol'})
+    
+        # Plotly is used to generate an interactive figure
+        self.fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # target symbol is added on secondary axis so shape can be compared to other symbols regardless of differences in magnitude
+        self.fig.add_trace(
+            go.Scatter(
+                x=pd.to_datetime(self.prices.T.index.values), 
+                y=self.prices.T[symbol], 
+                mode='lines', 
+                name=symbol
+            ),
+            secondary_y=True,
+        )
+        
+        # each similar symbol is added to the plot   
+        for ticker in data_plot.drop('Date', axis=1).columns.values:
+            self.fig.add_trace(
+                go.Scatter(
+                    x=data_plot['Date'], 
+                    y=data_plot[ticker], 
+                    mode='lines', 
+                    name=ticker
+                ),
+                secondary_y=False,
+            )
+        
+        # axis titles set
+        self.fig.update_layout(title_text="Stocks trending with "+symbol)
+        self.fig.update_xaxes(title_text="Date")
+        self.fig.update_yaxes(title_text="Relative Price", secondary_y=False)
+        
+        if save_fig:
+            if save_path == None:
+                print('Specify save_path')
+            else:
+                self.fig.write_html(save_path+'//'+symbol+".html")
